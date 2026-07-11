@@ -208,9 +208,9 @@ class _LossFns:
         adv = inputs["advantages"].to(logits.dtype)
         mask = inputs.get("mask")
         if mask is None:
-            mask = torch.ones_like(adv)
-        else:
-            mask = mask.to(logits.dtype)
+            raise ValueError("importance_sampling loss requires mask")
+
+        mask = mask.to(logits.dtype)
         new_lp = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         ratio = torch.exp(new_lp - old_lp)
         pg = -(ratio * adv) * mask
@@ -218,8 +218,8 @@ class _LossFns:
         loss = pg.sum() / denom
         metrics = {
             "total_loss": float(loss.detach().item()),
-            "mean_ratio": float(ratio.mean().detach().item()),
-            "kl_sample_train": float((old_lp - new_lp).mean().detach().item()),
+            "mean_ratio": float(((ratio * mask).sum() / denom).detach().item()),
+            "kl_sample_train": float((((old_lp - new_lp) * mask).sum() / denom).detach().item()),
         }
         return loss, new_lp.detach(), metrics
 
@@ -231,9 +231,9 @@ class _LossFns:
         adv = inputs["advantages"].to(logits.dtype)
         mask = inputs.get("mask")
         if mask is None:
-            mask = torch.ones_like(adv)
-        else:
-            mask = mask.to(logits.dtype)
+            raise ValueError("ppo loss requires mask")
+
+        mask = mask.to(logits.dtype)
         new_lp = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         ratio = torch.exp(new_lp - old_lp)
         unclipped = ratio * adv
@@ -243,10 +243,8 @@ class _LossFns:
         loss = pg.sum() / denom
         metrics = {
             "total_loss": float(loss.detach().item()),
-            "mean_ratio": float(ratio.mean().detach().item()),
-            "clip_frac": float(
-                ((unclipped > clipped).float() * mask).sum().item() / float(denom.item())
-            ),
+            "mean_ratio": float(((ratio * mask).sum() / denom).detach().item()),
+            "clip_frac": float(((unclipped > clipped).float() * mask).sum().item() / float(denom.item())),
         }
         return loss, new_lp.detach(), metrics
 
@@ -558,14 +556,14 @@ def do_forward_backward(payload: dict) -> dict:
                     - loss: -(exp(new_lp - old_lp) * advantage)의 masked 평균.
                     - per_pos_lp: new_lp, 즉 현재 모델의 target token logprob.
                     - metrics["total_loss"]: policy-gradient loss. RL에서는 음수일 수 있고, CE처럼 “항상 낮을수록 좋다”로 단순 해석하면 안 됩니다.
-                    - metrics["mean_ratio"]: exp(new_lp - old_lp) 평균. 1 근처면 old policy와 현재 policy가 비슷합니다.
-                    - metrics["kl_sample_train"]: old_lp - new_lp 평균. 양수면 현재 모델이 샘플 token에 더 낮은 확률을 준 것입니다.
+                    - metrics["mean_ratio"]: exp(new_lp - old_lp)의 masked 평균. 1 근처면 old policy와 현재 policy가 비슷합니다.
+                    - metrics["kl_sample_train"]: old_lp - new_lp의 masked 평균. 양수면 현재 모델이 샘플 token에 더 낮은 확률을 준 것입니다.
 
                     ppo:
                     - loss: importance sampling objective에 ratio clipping을 적용한 PPO loss.
                     - per_pos_lp: 현재 모델의 target token logprob.
                     - metrics["total_loss"]: clipped policy loss.
-                    - metrics["mean_ratio"]: policy ratio 평균.
+                    - metrics["mean_ratio"]: policy ratio의 masked 평균.
                     - metrics["clip_frac"]: clipping이 걸린 masked 위치 비율.
                 """
                 loss, per_pos_lp, metrics = loss_impl(logits, inputs, loss_fn_config)
