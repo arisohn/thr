@@ -172,6 +172,33 @@ _DTYPE = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 # ----------------------------------------------------------------------------
 class _LossFns:
     @staticmethod
+    def _validate_sequence_shapes(
+        loss_name: str,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        allowed_target_ndims: tuple[int, ...],
+    ) -> None:
+        """Validate per-datum tensor ranks and the shared sequence length N."""
+        if logits.ndim != 2:
+            raise ValueError(
+                f"{loss_name} requires logits with shape (N, V); "
+                f"got {tuple(logits.shape)}"
+            )
+        if targets.ndim not in allowed_target_ndims:
+            allowed = " or ".join(
+                "(N,)" if ndim == 1 else "(N, K)" for ndim in allowed_target_ndims
+            )
+            raise ValueError(
+                f"{loss_name} requires target_tokens with shape {allowed}; "
+                f"got {tuple(targets.shape)}"
+            )
+        if targets.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"{loss_name} requires target_tokens sequence length to match logits; "
+                f"got {targets.shape[0]} target positions and {logits.shape[0]} logit positions"
+            )
+
+    @staticmethod
     def _gather_target_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         logp = F.log_softmax(logits, dim=-1)
         if targets.ndim == 1:
@@ -182,9 +209,17 @@ class _LossFns:
     def cross_entropy(logits, inputs, loss_fn_config):
         del loss_fn_config
         targets = inputs["target_tokens"]
+        _LossFns._validate_sequence_shapes(
+            "cross_entropy", logits, targets, allowed_target_ndims=(1, 2)
+        )
         weights = inputs.get("weights")
         if weights is None:
             weights = torch.ones_like(targets, dtype=logits.dtype)
+        elif weights.shape != targets.shape:
+            raise ValueError(
+                "cross_entropy requires weights and target_tokens to have identical "
+                f"shapes; got {tuple(weights.shape)} and {tuple(targets.shape)}"
+            )
         tgt_lp = _LossFns._gather_target_logits(logits, targets)
         if targets.ndim == 1:
             per_tok = -weights.to(tgt_lp.dtype) * tgt_lp
@@ -192,10 +227,12 @@ class _LossFns:
         else:
             per_tok = -(weights.to(tgt_lp.dtype) * tgt_lp).sum(-1)
             out_lp = tgt_lp[..., 0]
-        denom = weights.sum().clamp_min(1.0)
-        loss = per_tok.sum() / denom
+        loss = per_tok.sum()
+        loss_value = float(loss.detach().item())
         metrics = {
-            "total_loss": float(loss.detach().item()),
+            "loss:sum": loss_value,
+            # Keep the legacy key for existing tinther consumers.
+            "total_loss": loss_value,
             "n_tokens": float(weights.sum().detach().item()),
         }
         return loss, out_lp.detach(), metrics
@@ -206,20 +243,24 @@ class _LossFns:
         targets = inputs["target_tokens"].long()
         old_lp = inputs["logprobs"].to(logits.dtype)
         adv = inputs["advantages"].to(logits.dtype)
-        mask = inputs.get("mask")
-        if mask is None:
-            raise ValueError("importance_sampling loss requires mask")
+        _LossFns._validate_sequence_shapes(
+            "importance_sampling", logits, targets, allowed_target_ndims=(1,)
+        )
+        if targets.shape != old_lp.shape or targets.shape != adv.shape:
+            raise ValueError(
+                "importance_sampling requires target_tokens, logprobs, and advantages "
+                f"to have identical shapes; got {targets.shape}, {old_lp.shape}, "
+                f"and {adv.shape}"
+            )
 
-        mask = mask.to(logits.dtype)
         new_lp = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         ratio = torch.exp(new_lp - old_lp)
-        pg = -(ratio * adv) * mask
-        denom = mask.sum().clamp_min(1.0)
-        loss = pg.sum() / denom
+        loss = -(ratio * adv).sum()
+        loss_value = float(loss.detach().item())
         metrics = {
-            "total_loss": float(loss.detach().item()),
-            "mean_ratio": float(((ratio * mask).sum() / denom).detach().item()),
-            "kl_sample_train": float((((old_lp - new_lp) * mask).sum() / denom).detach().item()),
+            "loss:sum": loss_value,
+            # Keep the legacy key for existing tinther consumers.
+            "total_loss": loss_value,
         }
         return loss, new_lp.detach(), metrics
 
@@ -229,22 +270,23 @@ class _LossFns:
         targets = inputs["target_tokens"].long()
         old_lp = inputs["logprobs"].to(logits.dtype)
         adv = inputs["advantages"].to(logits.dtype)
-        mask = inputs.get("mask")
-        if mask is None:
-            raise ValueError("ppo loss requires mask")
+        _LossFns._validate_sequence_shapes("ppo", logits, targets, allowed_target_ndims=(1,))
+        if targets.shape != old_lp.shape or targets.shape != adv.shape:
+            raise ValueError(
+                "ppo requires target_tokens, logprobs, and advantages to have identical "
+                f"shapes; got {targets.shape}, {old_lp.shape}, and {adv.shape}"
+            )
 
-        mask = mask.to(logits.dtype)
         new_lp = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         ratio = torch.exp(new_lp - old_lp)
         unclipped = ratio * adv
         clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * adv
-        pg = -torch.minimum(unclipped, clipped) * mask
-        denom = mask.sum().clamp_min(1.0)
-        loss = pg.sum() / denom
+        loss = -torch.minimum(unclipped, clipped).sum()
+        loss_value = float(loss.detach().item())
         metrics = {
-            "total_loss": float(loss.detach().item()),
-            "mean_ratio": float(((ratio * mask).sum() / denom).detach().item()),
-            "clip_frac": float(((unclipped > clipped).float() * mask).sum().item() / float(denom.item())),
+            "loss:sum": loss_value,
+            # Keep the legacy key for existing tinther consumers.
+            "total_loss": loss_value,
         }
         return loss, new_lp.detach(), metrics
 
@@ -475,12 +517,12 @@ def do_forward_backward(payload: dict) -> dict:
     When ``TINTHER_GRAD_ACCUM_STEPS`` (K) is set, the per-rank batch is split
     into K micro-batches; each micro-batch runs an independent forward+backward
     so peak activation memory scales with the micro-batch size rather than the
-    full local batch. Per-micro-batch losses are scaled by the same
-    fb-level denominator (``global_batch_size`` or ``n_local``) so the sum of
-    micro-batch backwards equals the original single-shot total backward —
-    gradients accumulate to the same value. DDP all-reduce is suppressed via
-    ``no_sync()`` on all but the last micro-batch so collectives fire once
-    per fb call.
+    full local batch. Loss implementations return token sums, which are summed
+    over datums and micro-batches. Because default DDP averages gradients across
+    ranks, every micro-batch loss is multiplied by the DDP world size so the
+    resulting gradient matches a single-process global sum. DDP all-reduce is
+    suppressed via ``no_sync()`` on all but the last micro-batch so collectives
+    fire once per forward_backward call.
     """
     loss_fn = payload["loss_fn"]
     loss_fn_config = payload.get("loss_fn_config") or None
@@ -497,17 +539,7 @@ def do_forward_backward(payload: dict) -> dict:
         raise RuntimeError(
             f"empty rank slice (n_global={n_global}, world_size={STATE.world_size})"
         )
-
-    global_batch_size = (loss_fn_config or {}).get("global_batch_size")
-    if global_batch_size is not None:
-        global_batch_size = int(global_batch_size)
-        if global_batch_size <= 0:
-            raise ValueError("loss_fn_config.global_batch_size must be positive")
-
-    if global_batch_size is not None:
-        denom_for_loss = max(1, global_batch_size // STATE.world_size)
-    else:
-        denom_for_loss = max(1, n_local)
+    ddp_world_size = dist.get_world_size()
 
     k_requested = _resolve_grad_accum_steps()
     k_eff = max(1, min(k_requested, n_local))
@@ -543,29 +575,6 @@ def do_forward_backward(payload: dict) -> dict:
                 logits = batch_logits[j, : seq_lens[j]]                             # (seq_lens[j], vocab_size)
                 inputs = loss_inputs_per_datum[j]                                   # dict[str, torch.Tensor]
 
-                """
-                    loss는 실제로 backward()에 쓰이는 scalar torch.Tensor입니다. 각 datum마다 계산한 loss를 micro-batch 안에서 더한 뒤, denom_for_loss 나눠 gradient를 만듭니다.
-
-                    cross_entropy:
-                    - loss: -log p(target)를 weights로 가중 평균한 NLL.
-                    - per_pos_lp: target token의 logprob. top-k soft target이면 첫 번째 target column의 logprob만 반환합니다.
-                    - metrics["total_loss"]: CE loss.
-                    - metrics["n_tokens"]: 해당 datum의 weight 합. 최종 로그에서는 batch 평균 token 수처럼 보입니다.
-
-                    importance_sampling:
-                    - loss: -(exp(new_lp - old_lp) * advantage)의 masked 평균.
-                    - per_pos_lp: new_lp, 즉 현재 모델의 target token logprob.
-                    - metrics["total_loss"]: policy-gradient loss. RL에서는 음수일 수 있고, CE처럼 “항상 낮을수록 좋다”로 단순 해석하면 안 됩니다.
-                    - metrics["mean_ratio"]: exp(new_lp - old_lp)의 masked 평균. 1 근처면 old policy와 현재 policy가 비슷합니다.
-                    - metrics["kl_sample_train"]: old_lp - new_lp의 masked 평균. 양수면 현재 모델이 샘플 token에 더 낮은 확률을 준 것입니다.
-
-                    ppo:
-                    - loss: importance sampling objective에 ratio clipping을 적용한 PPO loss.
-                    - per_pos_lp: 현재 모델의 target token logprob.
-                    - metrics["total_loss"]: clipped policy loss.
-                    - metrics["mean_ratio"]: policy ratio의 masked 평균.
-                    - metrics["clip_frac"]: clipping이 걸린 masked 위치 비율.
-                """
                 loss, per_pos_lp, metrics = loss_impl(logits, inputs, loss_fn_config)
                 mb_loss_sum = mb_loss_sum + loss
 
@@ -575,8 +584,11 @@ def do_forward_backward(payload: dict) -> dict:
                 for k, v in metrics.items():
                     local_metric_sums[k] = local_metric_sums.get(k, 0.0) + float(v)
 
-            mb_total_loss = mb_loss_sum / denom_for_loss                                # 이 rank가 담당하는 local batch 크기 기준의 normalization 값: micro-batch로 쪼개서 backward해도, 원래 full batch 한 번 backward한 것과 같은 gradient 크기
-            mb_total_loss.backward()
+            # DDP averages gradients across ranks. Scale every micro-batch before
+            # backward so no_sync accumulation reproduces the global summed loss:
+            # (1 / W) * sum_r grad(W * local_loss_r) == grad(global_loss).
+            backward_loss = mb_loss_sum * ddp_world_size
+            backward_loss.backward()
 
     STATE.last_loss = None
 
@@ -883,12 +895,9 @@ def run_worker_loop() -> None:
                         for k, v in g["metrics_local_sums"].items():
                             metrics_sums[k] = metrics_sums.get(k, 0.0) + float(v)
 
-                    denom = (
-                        int((payload.get("loss_fn_config") or {}).get("global_batch_size"))
-                        if (payload.get("loss_fn_config") or {}).get("global_batch_size")
-                        else n_global
-                    )
-                    aggregated = {k: v / denom for k, v in metrics_sums.items()}
+                    # Loss functions emit additive metrics (for example
+                    # ``loss:sum``), so gathering across ranks is a sum as well.
+                    aggregated = metrics_sums
                     pkg["future"].set_result(
                         {"metrics": aggregated, "loss_fn_outputs": all_outputs}
                     )
