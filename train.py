@@ -167,6 +167,55 @@ class Command:
 _DTYPE = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
+def _backward_loss_scale(
+    ddp_world_size: int,
+    global_valid_token_count: float | None,
+) -> float:
+    """Return the local-loss scale that produces a global token mean in DDP."""
+    if ddp_world_size < 1:
+        raise ValueError(f"ddp_world_size must be positive; got {ddp_world_size}")
+    if global_valid_token_count is None:
+        return float(ddp_world_size)
+    if not np.isfinite(global_valid_token_count) or global_valid_token_count <= 0:
+        raise ValueError(
+            "global_valid_token_count must be positive and finite; "
+            f"got {global_valid_token_count!r}"
+        )
+    return ddp_world_size / global_valid_token_count
+
+
+def _infer_global_valid_token_count(datums_all: list[dict]) -> float:
+    """Infer action-token count from the zero-logprob observation sentinel.
+
+    ``assemble_training_data`` stores exactly ``0.0`` at prompt/observation
+    positions and sampled log probabilities at action positions. This avoids
+    transmitting the training mask, but an action token whose sampled log
+    probability is exactly zero cannot be distinguished from an observation.
+    """
+    valid_token_count = 0
+    for datum_idx, datum in enumerate(datums_all):
+        logprobs_payload = datum["loss_fn_inputs"].get("logprobs")
+        if logprobs_payload is None:
+            raise ValueError(
+                "valid-token inference requires logprobs for every datum; "
+                f"datum {datum_idx} has none"
+            )
+
+        shape = tuple(int(dim) for dim in logprobs_payload["shape"])
+        try:
+            logprobs = np.asarray(logprobs_payload["data"], dtype=np.float32).reshape(shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid logprobs payload for datum {datum_idx}") from exc
+
+        if not np.all(np.isfinite(logprobs)):
+            raise ValueError(f"logprobs for datum {datum_idx} contain non-finite values")
+        valid_token_count += int(np.count_nonzero(logprobs != 0.0))
+
+    if valid_token_count <= 0:
+        raise ValueError("no valid training tokens inferred from logprobs")
+    return float(valid_token_count)
+
+
 # ----------------------------------------------------------------------------
 # Loss functions (mirror tinther._LossFns)
 # ----------------------------------------------------------------------------
@@ -519,8 +568,10 @@ def do_forward_backward(payload: dict) -> dict:
     so peak activation memory scales with the micro-batch size rather than the
     full local batch. Loss implementations return token sums, which are summed
     over datums and micro-batches. Because default DDP averages gradients across
-    ranks, every micro-batch loss is multiplied by the DDP world size so the
-    resulting gradient matches a single-process global sum. DDP all-reduce is
+    ranks, every micro-batch loss is multiplied by the DDP world size. For
+    importance-sampling and PPO losses, the full-request valid-token count is
+    inferred from the sampled-logprob sentinel and used for every micro-batch,
+    so accumulation reproduces a global token-mean loss. DDP all-reduce is
     suppressed via ``no_sync()`` on all but the last micro-batch so collectives
     fire once per forward_backward call.
     """
@@ -532,6 +583,12 @@ def do_forward_backward(payload: dict) -> dict:
         raise ValueError(f"unknown loss_fn: {loss_fn}")
     loss_impl = _LossFns.DISPATCH[loss_fn]
 
+    global_valid_token_count = (
+        _infer_global_valid_token_count(datums_all)
+        if loss_fn in {"importance_sampling", "ppo"}
+        else None
+    )
+
     local, n_global = _slice_for_rank(datums_all)
     STATE.model.train()
     n_local = len(local)
@@ -540,6 +597,10 @@ def do_forward_backward(payload: dict) -> dict:
             f"empty rank slice (n_global={n_global}, world_size={STATE.world_size})"
         )
     ddp_world_size = dist.get_world_size()
+    backward_loss_scale = _backward_loss_scale(
+        ddp_world_size,
+        global_valid_token_count,
+    )
 
     k_requested = _resolve_grad_accum_steps()
     k_eff = max(1, min(k_requested, n_local))
@@ -584,10 +645,12 @@ def do_forward_backward(payload: dict) -> dict:
                 for k, v in metrics.items():
                     local_metric_sums[k] = local_metric_sums.get(k, 0.0) + float(v)
 
-            # DDP averages gradients across ranks. Scale every micro-batch before
-            # backward so no_sync accumulation reproduces the global summed loss:
-            # (1 / W) * sum_r grad(W * local_loss_r) == grad(global_loss).
-            backward_loss = mb_loss_sum * ddp_world_size
+            # DDP averages gradients across ranks. Scale every micro-batch by W
+            # so no_sync accumulation reproduces a global sum. If N is supplied,
+            # use the same full-request denominator for every micro-batch:
+            # (1 / W) * sum_r grad((W / N) * local_loss_r)
+            #     == grad(global_loss / N).
+            backward_loss = mb_loss_sum * backward_loss_scale
             backward_loss.backward()
 
     STATE.last_loss = None
